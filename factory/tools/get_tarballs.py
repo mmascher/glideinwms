@@ -54,13 +54,23 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 from collections import UserDict
-from distutils.version import StrictVersion
 from html.parser import HTMLParser
 from urllib import request
 from urllib.error import HTTPError
 from urllib.parse import urljoin
 
 import yaml
+
+
+def version_sort_key(version):
+    """Return a sortable numeric key for HTCondor versions.
+
+    Accepts dotted numeric versions with two or three components (e.g. 23.0, 23.0.1).
+    """
+    if not re.match(r"^\d+(?:\.\d+){1,2}$", version):
+        raise ValueError(f"Invalid version string: {version}")
+    parts = [int(part) for part in version.split(".")]
+    return tuple(parts + [0] * (3 - len(parts)))
 
 
 class ConfigError(Exception):
@@ -130,7 +140,7 @@ class TarballManager(HTMLParser):
         if len(self.releases) == 0:
             print(f"Cannot find any release in {self.release_url}")
         else:
-            self.releases.sort(key=StrictVersion)
+            self.releases.sort(key=version_sort_key)
             self.latest_version = self.releases[-1]
 
     def _add_release(self, version, release_dir):
@@ -255,7 +265,25 @@ class TarballManager(HTMLParser):
         except KeyError:
             return None
 
-    def generate_xml(self, os_map, arch_map, whitelist, blacklist, default_tarball_versions, assigned_defaults=None):
+    def _latest_version_for_selection(self, whitelist, blacklist):
+        """Return the latest version for this manager and selection filters."""
+        if whitelist != []:
+            return sorted(whitelist, key=version_sort_key)[-1]
+        versions = list(set(self.releases) - set(blacklist))
+        return sorted(versions, key=version_sort_key)[-1]
+
+    @staticmethod
+    def _tarball_metadata(dest_file, latest_version):
+        """Return (arch, opsystem, version_string_without_default) for one tarball."""
+        _, sversion, os_arch, _ = os.path.basename(dest_file).split("-")
+        arch, opsystem = os_arch.rsplit("_", 1)
+        version = sversion
+        if sversion == latest_version:
+            major, minor, _ = sversion.split(".")
+            version += "," + major + ".0.x" if minor == "0" else "," + major + ".x"
+        return arch, opsystem, version
+
+    def generate_xml(self, os_map, arch_map, whitelist, blacklist, selected_defaults):
         """Generate an XML snippet for the tarball configuration.
 
         The XML snippet is intended for inclusion in the <condor_tarballs> section of the glideinWMS.xml file.
@@ -268,43 +296,56 @@ class TarballManager(HTMLParser):
             whitelist (list): List of versions to include. If non-empty, only these versions are used.
                 Can be "latest" to download the latest version.
             blacklist (list): List of versions to exclude.
-            default_tarball_versions (list): Ordered list of default tarball versions. ",default" will be
-                added to the version attribute in the XML for the first matching value in the list.
-            assigned_defaults (set, optional): Set of (arch, opsystem) tuples already tagged as default.
-                If provided, each OS/arch pair will get at most one ",default" entry across all generated
-                XML snippets.
+            selected_defaults (dict): Mapping from (arch, opsystem) tuple to selected default token.
+                Only tarballs matching that token for the given OS/arch pair will get ",default".
 
         Returns:
             str: An XML snippet containing multiple <condor_tarball> elements.
         """
         xml_snippet = '      <condor_tarball arch="{arch}" os="{os}" tar_file="{dest_file}" version="{version}"/>\n'
 
-        if whitelist != []:
-            latest_version = sorted(whitelist, key=StrictVersion)[-1]
-        else:
-            versions = list(set(self.releases) - set(blacklist))
-            latest_version = sorted(versions, key=StrictVersion)[-1]
+        latest_version = self._latest_version_for_selection(whitelist, blacklist)
 
         out = ""
         self.default_found = False
         for dest_file in self.downloaded_files:
-            _, sversion, os_arch, _ = os.path.basename(dest_file).split("-")
-            arch, opsystem = os_arch.rsplit("_", 1)
-            version = sversion  # sversion = "split" version
-            if sversion == latest_version:
-                major, minor, _ = sversion.split(".")
-                version += "," + major + ".0.x" if minor == "0" else "," + major + ".x"
-            arch_os = (arch, opsystem)
-            if assigned_defaults is None or arch_os not in assigned_defaults:
-                for default_tarball_version in default_tarball_versions:
-                    if default_tarball_version in version.split(","):
-                        self.default_found = True
-                        version += ",default"
-                        if assigned_defaults is not None:
-                            assigned_defaults.add(arch_os)
-                        break
+            arch, opsystem, version = self._tarball_metadata(dest_file, latest_version)
+            selected_default = selected_defaults.get((arch, opsystem))
+            if selected_default and selected_default in version.split(","):
+                self.default_found = True
+                version += ",default"
             out += xml_snippet.format(arch=arch_map[arch], os=os_map[opsystem], dest_file=dest_file, version=version)
         return out
+
+
+def pick_default_tokens(manager_entries, default_tarball_versions):
+    """Pick one default token per (arch, opsystem) using global priority order.
+
+    Args:
+        manager_entries (list): List of tuples (manager, whitelist, blacklist).
+        default_tarball_versions (list): Ordered default priority list.
+
+    Returns:
+        dict: Mapping (arch, opsystem) -> selected default token.
+    """
+    selected_defaults = {}
+    selected_rank = {}
+
+    for manager, whitelist, blacklist in manager_entries:
+        latest_version = manager._latest_version_for_selection(whitelist, blacklist)
+        for dest_file in manager.downloaded_files:
+            arch, opsystem, version = manager._tarball_metadata(dest_file, latest_version)
+            key = (arch, opsystem)
+            version_tokens = set(version.split(","))
+
+            for rank, default_token in enumerate(default_tarball_versions):
+                if default_token in version_tokens:
+                    if key not in selected_rank or rank < selected_rank[key]:
+                        selected_rank[key] = rank
+                        selected_defaults[key] = default_token
+                    break
+
+    return selected_defaults
 
 
 class Config(UserDict):
@@ -342,8 +383,8 @@ class Config(UserDict):
             if "latest" in major_dict["WHITELIST"]:
                 major_dict["WHITELIST"].remove("latest")
                 major_dict["DOWNLOAD_LATEST"] = True
-            major_dict["WHITELIST"].sort(key=StrictVersion)
-            major_dict["BLACKLIST"].sort(key=StrictVersion)
+            major_dict["WHITELIST"].sort(key=version_sort_key)
+            major_dict["BLACKLIST"].sort(key=version_sort_key)
 
         default_tarballs = self.get("DEFAULT_TARBALL_VERSION")
 
@@ -515,8 +556,8 @@ def main():
     default_tarball_versions = config["DEFAULT_TARBALL_VERSION"]
 
     default_found = False
-    assigned_defaults = set()
     xml = ""
+    manager_entries = []
 
     if args.checklatest is True:
         return checklatest(config, args.verbose)
@@ -540,17 +581,22 @@ def main():
                 manager.download_tarballs(version)
         else:
             # Get everything but the blacklisted
-            to_download = sorted(set(manager.releases) - set(major_dict["BLACKLIST"]), key=StrictVersion)
+            to_download = sorted(set(manager.releases) - set(major_dict["BLACKLIST"]), key=version_sort_key)
             for version in to_download:
                 manager.download_tarballs(version)
-        if config.get("XML_OUT") is not None:
+
+        manager_entries.append((manager, major_dict["WHITELIST"], major_dict["BLACKLIST"]))
+
+    if config.get("XML_OUT") is not None:
+        selected_defaults = pick_default_tokens(manager_entries, default_tarball_versions)
+
+        for manager, whitelist, blacklist in manager_entries:
             xml += manager.generate_xml(
                 config["OS_MAP"],
                 config["ARCH_MAP"],
-                major_dict["WHITELIST"],
-                major_dict["BLACKLIST"],
-                default_tarball_versions,
-                assigned_defaults,
+                whitelist,
+                blacklist,
+                selected_defaults,
             )
             default_found |= manager.default_found
 
